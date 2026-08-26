@@ -2,12 +2,14 @@
 
 // Descarga y arma las cotizaciones. Misma lógica que la app Flutter:
 //  - USD: casas de cambio reales (API dolarpy)
-//  - BRL/ARS/EUR: compra/venta reales por sucursal de Cambios Alberdi
-//    (incluye frontera); respaldo cross-rate vía dólar (open.er-api) si falla.
+//  - BRL/ARS/EUR: compra/venta reales de varias casas multi-moneda
+//    (Cambios Alberdi por sucursal + La Moneda de Ciudad del Este; incluye
+//    frontera). Respaldo cross-rate vía dólar (open.er-api) si todas fallan.
 
 const DOLARPY_URL = process.env.DOLARPY_URL || 'https://dolar.melizeche.com/api/1.0/';
 const FX_USD_URL = process.env.FX_USD_URL || 'https://open.er-api.com/v6/latest/USD';
 const ALBERDI_URL = process.env.ALBERDI_URL || 'https://www.cambiosalberdi.com/ws/getTablero.json';
+const LA_MONEDA_URL = process.env.LA_MONEDA_URL || 'https://lamoneda.com.py/api/cotizaciones';
 const TIMEOUT_MS = 12000;
 
 const ALBERDI_BRANCHES = {
@@ -132,6 +134,42 @@ async function fetchAlberdi() {
   }
 }
 
+// La Moneda (Ciudad del Este). API JSON con números ya parseados.
+async function fetchLaMoneda() {
+  try {
+    const data = await getJson(LA_MONEDA_URL);
+    const map = { REAL: 'BRL', PESOS: 'ARS', EURO: 'EUR' };
+    const result = { BRL: [], ARS: [], EUR: [] };
+    for (const it of data.cotizaciones || []) {
+      if (it.moneda2 !== 'GUARANI') continue;
+      const code = map[it.moneda1];
+      if (!code) continue;
+      const compra = Number(it.compra);
+      const venta = Number(it.venta);
+      if (compra > 0 && venta > 0) {
+        result[code].push({ house: 'La Moneda · Ciudad del Este', compra, venta });
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+// Combina todas las fuentes multi-moneda (agregar más acá es trivial).
+async function fetchMultiCurrency() {
+  const merged = { BRL: [], ARS: [], EUR: [] };
+  const sources = await Promise.allSettled([fetchAlberdi(), fetchLaMoneda()]);
+  for (const s of sources) {
+    if (s.status !== 'fulfilled' || !s.value) continue;
+    for (const code of Object.keys(merged)) {
+      if (Array.isArray(s.value[code])) merged[code].push(...s.value[code]);
+    }
+  }
+  for (const list of Object.values(merged)) list.sort((a, b) => a.venta - b.venta);
+  return merged;
+}
+
 // Devuelve { updatedAt, currencies: { USD:{quotes,...}, BRL:{...}, ... } }
 async function fetchRates() {
   const now = new Date().toISOString();
@@ -139,7 +177,7 @@ async function fetchRates() {
   if (!usd.length) throw new Error('Sin cotizaciones de dólar');
 
   const fx = await fetchFxUsd();
-  const alberdi = await fetchAlberdi(); // BRL/ARS/EUR reales por sucursal
+  const multi = await fetchMultiCurrency(); // BRL/ARS/EUR reales (varias casas)
 
   const currencies = {
     USD: buildSnapshot('USD', usd, now, false),
@@ -152,7 +190,7 @@ async function fetchRates() {
       : null;
 
   const addCurrency = (code, perUsd) => {
-    const real = alberdi[code];
+    const real = multi[code];
     if (real && real.length) {
       currencies[code] = buildSnapshot(code, real, now, false);
     } else {
