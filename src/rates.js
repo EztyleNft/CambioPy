@@ -2,11 +2,28 @@
 
 // Descarga y arma las cotizaciones. Misma lógica que la app Flutter:
 //  - USD: casas de cambio reales (API dolarpy)
-//  - BRL/ARS: referencia derivada del dólar local vía open.er-api.
+//  - BRL/ARS/EUR: compra/venta reales por sucursal de Cambios Alberdi
+//    (incluye frontera); respaldo cross-rate vía dólar (open.er-api) si falla.
 
 const DOLARPY_URL = process.env.DOLARPY_URL || 'https://dolar.melizeche.com/api/1.0/';
 const FX_USD_URL = process.env.FX_USD_URL || 'https://open.er-api.com/v6/latest/USD';
+const ALBERDI_URL = process.env.ALBERDI_URL || 'https://www.cambiosalberdi.com/ws/getTablero.json';
 const TIMEOUT_MS = 12000;
+
+const ALBERDI_BRANCHES = {
+  villamorra: 'Villamorra',
+  ciudaddeleste: 'Ciudad del Este',
+  saltodelguaira: 'Salto del Guairá',
+  km4: 'Km 4',
+  encarnacion: 'Encarnación',
+};
+
+// "5.900" -> 5900 ; "3,65" -> 3.65 (punto=miles, coma=decimal).
+function parsePy(s) {
+  const t = String(s).trim().replace(/\./g, '').replace(',', '.');
+  const n = parseFloat(t);
+  return isFinite(n) ? n : 0;
+}
 
 const HOUSE_NAMES = {
   bcp: 'BCP (oficial)',
@@ -89,43 +106,75 @@ async function fetchFxUsd() {
   }
 }
 
-// Devuelve { updatedAt, currencies: { USD:{quotes,...}, BRL:{...}, ARS:{...} } }
+// { BRL:[...], ARS:[...], EUR:[...] } con compra/venta reales por sucursal de
+// Cambios Alberdi. Map vacío si falla (se usa el cross-rate como respaldo).
+async function fetchAlberdi() {
+  try {
+    const data = await getJson(ALBERDI_URL);
+    const result = { BRL: [], ARS: [], EUR: [] };
+    for (const [branchKey, items] of Object.entries(data)) {
+      if (!Array.isArray(items)) continue;
+      const bname = ALBERDI_BRANCHES[branchKey] || branchKey;
+      for (const it of items) {
+        const code = it && it.bcp;
+        if (!result[code]) continue;
+        const compra = parsePy(it.compra);
+        const venta = parsePy(it.venta);
+        if (compra > 0 && venta > 0) {
+          result[code].push({ house: `Alberdi · ${bname}`, compra, venta });
+        }
+      }
+    }
+    for (const list of Object.values(result)) list.sort((a, b) => a.venta - b.venta);
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+// Devuelve { updatedAt, currencies: { USD:{quotes,...}, BRL:{...}, ... } }
 async function fetchRates() {
   const now = new Date().toISOString();
   const usd = await fetchUsdQuotes();
   if (!usd.length) throw new Error('Sin cotizaciones de dólar');
 
   const fx = await fetchFxUsd();
+  const alberdi = await fetchAlberdi(); // BRL/ARS/EUR reales por sucursal
 
   const currencies = {
-    USD: buildSnapshot('USD', usd, now),
+    USD: buildSnapshot('USD', usd, now, false),
   };
 
-  // Cotización POR CASA a partir de su dólar (compra/venta ÷ USD→moneda).
+  // Respaldo: cotización derivada del dólar (cross-rate).
   const crossQuotes = (perUsd) =>
     perUsd > 0
       ? usd.map((q) => ({ house: q.house, compra: q.compra / perUsd, venta: q.venta / perUsd }))
       : null;
 
-  const addCross = (code, perUsd) => {
-    const qs = crossQuotes(perUsd);
-    if (qs && qs.length) currencies[code] = buildSnapshot(code, qs, now);
+  const addCurrency = (code, perUsd) => {
+    const real = alberdi[code];
+    if (real && real.length) {
+      currencies[code] = buildSnapshot(code, real, now, false);
+    } else {
+      const qs = crossQuotes(perUsd);
+      if (qs && qs.length) currencies[code] = buildSnapshot(code, qs, now, true);
+    }
   };
 
-  addCross('BRL', fx.BRL);
-  addCross('ARS', fx.ARS);
-  addCross('EUR', fx.EUR);
+  addCurrency('BRL', fx.BRL);
+  addCurrency('ARS', fx.ARS);
+  addCurrency('EUR', fx.EUR);
 
   return { updatedAt: now, currencies };
 }
 
 // Agrega los "mejores" precios a un snapshot.
-function buildSnapshot(code, quotes, updatedAt) {
+function buildSnapshot(code, quotes, updatedAt, estimated = false) {
   const bestToBuy = quotes.reduce((a, b) => (a.venta <= b.venta ? a : b)); // menor venta
   const bestToSell = quotes.reduce((a, b) => (a.compra >= b.compra ? a : b)); // mayor compra
   const avgCompra = quotes.reduce((s, q) => s + q.compra, 0) / quotes.length;
   const avgVenta = quotes.reduce((s, q) => s + q.venta, 0) / quotes.length;
-  return { currency: code, quotes, updatedAt, bestToBuy, bestToSell, avgCompra, avgVenta };
+  return { currency: code, quotes, updatedAt, estimated, bestToBuy, bestToSell, avgCompra, avgVenta };
 }
 
 module.exports = { fetchRates, buildSnapshot };
